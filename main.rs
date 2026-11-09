@@ -3,52 +3,79 @@ use std::{
     error::Error,
     net::Ipv4Addr,
     num::{NonZeroU16, NonZeroU64},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    time::Duration,
 };
 
 use axum::{Router, extract::State, http::StatusCode, routing::get};
 use serenity::all::{
     Client, Context, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
-    EventHandler, GatewayIntents, GuildId, Http, Interaction, Ready,
+    EventHandler, GatewayIntents, GuildId, Http, Interaction, Ready, ShardStageUpdateEvent,
 };
 use serenity::http::HttpError;
-use tokio::{net::TcpListener, sync::OnceCell};
+use tokio::{
+    net::TcpListener,
+    sync::{OnceCell, watch},
+    time::timeout,
+};
 
 const PRODUCTION_BOT_ID: u64 = 1_553_826_513_474_945_114;
 const PING: &str = "ping";
+const REST_TIMEOUT: Duration = Duration::from_secs(20);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscordStartup {
+    Verifying,
+    Initializing,
+    Connecting,
+    Registering,
+    RegistrationFailed,
+    Ready,
+}
 
 struct Prototype {
     guild_id: GuildId,
     registered: OnceCell<()>,
-    ready: Arc<AtomicBool>,
+    startup: watch::Sender<DiscordStartup>,
 }
 
 #[serenity::async_trait]
 impl EventHandler for Prototype {
+    async fn shard_stage_update(&self, _: Context, event: ShardStageUpdateEvent) {
+        println!("Discord gateway stage: {:?}.", event.new);
+    }
+
     async fn ready(&self, context: Context, ready: Ready) {
-        let registered = self
-            .registered
+        let _ = self.registered
             .get_or_try_init(|| async {
-                self.guild_id
-                    .create_command(
+                self.startup.send_replace(DiscordStartup::Registering);
+                println!("Discord READY received. Registering /ping in test server {}.", self.guild_id);
+                let result = timeout(
+                    REST_TIMEOUT,
+                    self.guild_id.create_command(
                         &context.http,
                         CreateCommand::new(PING).description("Check if the prototype is online"),
-                    )
-                    .await?;
-                self.ready.store(true, Ordering::Relaxed);
+                    ),
+                )
+                .await;
+                let error = match result {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(error)) => Some(discord_error(&error)),
+                    Err(_) => Some("Discord did not respond within 20 seconds.".into()),
+                };
+                if let Some(error) = error {
+                    eprintln!("Could not register /ping: {error} Check the test server ID and app installation.");
+                    self.startup.send_replace(DiscordStartup::RegistrationFailed);
+                    return Err(());
+                }
                 println!(
                     "{} is ready in test server {}.",
                     ready.user.name, self.guild_id
                 );
-                Ok::<(), serenity::Error>(())
+                self.startup.send_replace(DiscordStartup::Ready);
+                Ok(())
             })
             .await;
-        if let Err(error) = registered {
-            eprintln!("Could not register /ping: {}", discord_error(&error));
-        }
     }
 
     async fn interaction_create(&self, context: Context, interaction: Interaction) {
@@ -73,19 +100,25 @@ impl EventHandler for Prototype {
     }
 }
 
-fn web_routes(ready: Arc<AtomicBool>) -> Router {
+fn web_routes(startup: watch::Receiver<DiscordStartup>) -> Router {
     Router::new()
         .route("/", get(|| async { "Vivian Rust prototype\n" }))
         .route("/healthz", get(healthz))
-        .with_state(ready)
+        .with_state(startup)
 }
 
-async fn healthz(State(ready): State<Arc<AtomicBool>>) -> (StatusCode, &'static str) {
-    if ready.load(Ordering::Relaxed) {
-        (StatusCode::OK, "ready\n")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "starting\n")
-    }
+async fn healthz(
+    State(startup): State<watch::Receiver<DiscordStartup>>,
+) -> (StatusCode, &'static str) {
+    let body = match *startup.borrow() {
+        DiscordStartup::Verifying => "starting: verifying Discord bot token\n",
+        DiscordStartup::Initializing => "starting: initializing Discord gateway\n",
+        DiscordStartup::Connecting => "starting: waiting for Discord READY\n",
+        DiscordStartup::Registering => "starting: registering /ping\n",
+        DiscordStartup::RegistrationFailed => "failed: could not register /ping\n",
+        DiscordStartup::Ready => return (StatusCode::OK, "ready\n"),
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, body)
 }
 
 fn discord_error(error: &serenity::Error) -> String {
@@ -136,23 +169,57 @@ async fn verify_test_bot(http: &Http) -> Result<(), String> {
 async fn run_discord(
     token: &str,
     guild_id: GuildId,
-    ready: Arc<AtomicBool>,
+    startup: watch::Sender<DiscordStartup>,
 ) -> Result<(), Box<dyn Error>> {
-    verify_test_bot(&Http::new(token)).await?;
+    println!("Verifying the Discord test bot token.");
+    timeout(REST_TIMEOUT, verify_test_bot(&Http::new(token)))
+        .await
+        .map_err(|_| "Discord bot verification timed out after 20 seconds.")??;
+    startup.send_replace(DiscordStartup::Initializing);
+    println!("Discord test bot token verified. Initializing the gateway client.");
 
-    let mut client = Client::builder(token, GatewayIntents::empty())
-        .event_handler(Prototype {
+    let mut status = startup.subscribe();
+    let mut client = timeout(
+        REST_TIMEOUT,
+        Client::builder(token, GatewayIntents::empty()).event_handler(Prototype {
             guild_id,
             registered: OnceCell::new(),
-            ready,
-        })
-        .await
-        .map_err(|_| "Could not initialize the Discord client.")?;
-    client
-        .start()
-        .await
-        .map_err(|_| "The Discord gateway stopped with an error.")?;
-    Ok(())
+            startup: startup.clone(),
+        }),
+    )
+    .await
+    .map_err(|_| "Discord gateway initialization timed out after 20 seconds.")?
+    .map_err(|_| "Could not initialize the Discord client.")?;
+
+    startup.send_replace(DiscordStartup::Connecting);
+    println!("Connecting to the Discord gateway.");
+    let gateway = client.start();
+    tokio::pin!(gateway);
+    tokio::select! {
+        result = &mut gateway => return gateway_exit(result),
+        started = timeout(STARTUP_TIMEOUT, status.wait_for(|phase| {
+            matches!(phase, DiscordStartup::Ready | DiscordStartup::RegistrationFailed)
+        })) => match started {
+            Ok(Ok(phase)) if *phase == DiscordStartup::Ready => {}
+            Ok(Ok(_)) => return Err("Initial /ping registration failed. See the preceding Discord error.".into()),
+            Ok(Err(_)) => return Err("The Discord startup status channel closed.".into()),
+            Err(_) => return Err(match *startup.borrow() {
+                DiscordStartup::Registering => "Initial /ping registration did not finish within 60 seconds.",
+                _ => "Discord gateway did not send READY within 60 seconds.",
+            }.into()),
+        }
+    }
+    gateway_exit(gateway.await)
+}
+
+fn gateway_exit(result: serenity::Result<()>) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(()) => Err("The Discord gateway stopped unexpectedly.".into()),
+        Err(serenity::Error::Gateway(error)) => {
+            Err(format!("The Discord gateway stopped: {error}").into())
+        }
+        Err(_) => Err("The Discord gateway stopped with an error.".into()),
+    }
 }
 
 #[tokio::main]
@@ -180,10 +247,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port.get())).await?;
     println!("HTTP listening on 0.0.0.0:{port}.");
 
-    let ready = Arc::new(AtomicBool::new(false));
-    let router = web_routes(Arc::clone(&ready));
+    let (startup, status) = watch::channel(DiscordStartup::Verifying);
+    let router = web_routes(status);
     tokio::select! {
-        result = run_discord(token, guild_id, ready) => result,
+        result = run_discord(token, guild_id, startup) => result,
         result = axum::serve(listener, router) => result.map_err(Into::into),
     }
 }
@@ -197,14 +264,22 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_waits_for_command_registration() {
-        let ready = Arc::new(AtomicBool::new(false));
-        let app = web_routes(Arc::clone(&ready));
+        let (startup, status) = watch::channel(DiscordStartup::Verifying);
+        let app = web_routes(status);
         let request = || Request::get("/healthz").body(Body::empty()).unwrap();
 
         let starting = app.clone().oneshot(request()).await.unwrap();
         assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        ready.store(true, Ordering::Relaxed);
+        startup.send_replace(DiscordStartup::Registering);
+        let registering = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(registering.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        startup.send_replace(DiscordStartup::RegistrationFailed);
+        let failed = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        startup.send_replace(DiscordStartup::Ready);
         let running = app.oneshot(request()).await.unwrap();
         assert_eq!(running.status(), StatusCode::OK);
     }
