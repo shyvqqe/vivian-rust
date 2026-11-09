@@ -14,9 +14,10 @@ use serenity::all::{
     Client, Context, CreateCommand, CreateInteractionResponse, CreateInteractionResponseMessage,
     EventHandler, GatewayIntents, GuildId, Http, Interaction, Ready,
 };
+use serenity::http::HttpError;
 use tokio::{net::TcpListener, sync::OnceCell};
 
-const PRODUCTION_APPLICATION_ID: u64 = 1_553_826_513_474_945_114;
+const PRODUCTION_BOT_ID: u64 = 1_553_826_513_474_945_114;
 const PING: &str = "ping";
 
 struct Prototype {
@@ -45,8 +46,8 @@ impl EventHandler for Prototype {
                 Ok::<(), serenity::Error>(())
             })
             .await;
-        if registered.is_err() {
-            eprintln!("Could not register /ping. Check the test server ID and bot installation.");
+        if let Err(error) = registered {
+            eprintln!("Could not register /ping: {}", discord_error(&error));
         }
     }
 
@@ -87,18 +88,57 @@ async fn healthz(State(ready): State<Arc<AtomicBool>>) -> (StatusCode, &'static 
     }
 }
 
+fn discord_error(error: &serenity::Error) -> String {
+    match error {
+        serenity::Error::Http(HttpError::UnsuccessfulRequest(response)) => {
+            return match response.status_code.as_u16() {
+                401 => "HTTP 401: Discord rejected the bot token. Check VIVIAN_TEST_DISCORD_TOKEN."
+                    .into(),
+                403 => "HTTP 403: Discord denied access.".into(),
+                429 => "HTTP 429: Discord rate limited the request.".into(),
+                status => format!("Discord returned HTTP {status}."),
+            };
+        }
+        serenity::Error::Http(HttpError::InvalidHeader(_)) => {
+            "The bot token contains invalid characters."
+        }
+        serenity::Error::Http(HttpError::Request(error)) if error.is_timeout() => {
+            "The Discord request timed out."
+        }
+        serenity::Error::Http(HttpError::Request(error)) if error.is_connect() => {
+            "Could not connect to Discord."
+        }
+        serenity::Error::Http(HttpError::Request(error)) if error.is_decode() => {
+            "Discord returned an unreadable response."
+        }
+        serenity::Error::Json(_) | serenity::Error::Decode(..) => {
+            "Discord returned an unreadable response."
+        }
+        _ => "The Discord request could not be completed.",
+    }
+    .into()
+}
+
+async fn verify_test_bot(http: &Http) -> Result<(), String> {
+    let user = http
+        .get_current_user()
+        .await
+        .map_err(|error| format!("Discord bot verification failed: {}", discord_error(&error)))?;
+    if !user.bot {
+        return Err("Use the token from the Bot tab of the test Discord application.".into());
+    }
+    if user.id.get() == PRODUCTION_BOT_ID {
+        return Err("Use a separate Discord application for the prototype.".into());
+    }
+    Ok(())
+}
+
 async fn run_discord(
     token: &str,
     guild_id: GuildId,
     ready: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
-    let application = Http::new(token)
-        .get_current_application_info()
-        .await
-        .map_err(|_| "Could not verify the test application with Discord. Check the token and connection.")?;
-    if application.id.get() == PRODUCTION_APPLICATION_ID {
-        return Err("Use a separate Discord application for the prototype.".into());
-    }
+    verify_test_bot(&Http::new(token)).await?;
 
     let mut client = Client::builder(token, GatewayIntents::empty())
         .event_handler(Prototype {
@@ -152,6 +192,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use serenity::http::HttpBuilder;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -166,5 +207,49 @@ mod tests {
         ready.store(true, Ordering::Relaxed);
         let running = app.oneshot(request()).await.unwrap();
         assert_eq!(running.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bot_verification_identifies_unauthorized_and_blocks_production() {
+        let cases = [
+            (
+                StatusCode::UNAUTHORIZED,
+                r#"{"code":0,"message":"private response detail"}"#,
+                Some("HTTP 401"),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"id":"1553826513474945114","username":"Vivian","bot":true}"#,
+                Some("separate Discord application"),
+            ),
+            (
+                StatusCode::OK,
+                r#"{"id":"100","username":"Vivian Test","bot":true}"#,
+                None,
+            ),
+        ];
+        for (status, body, expected_error) in cases {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/api/v10/users/@me",
+                get(move || async move { (status, body) }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let http = HttpBuilder::new("test-token")
+                .proxy(format!("http://{address}"))
+                .ratelimiter_disabled(true)
+                .build();
+            let result = verify_test_bot(&http).await;
+            server.abort();
+            match expected_error {
+                Some(message) => {
+                    let error = result.unwrap_err();
+                    assert!(error.contains(message), "{error}");
+                    assert!(!error.contains("private response detail"));
+                }
+                None => assert!(result.is_ok(), "{result:?}"),
+            }
+        }
     }
 }
